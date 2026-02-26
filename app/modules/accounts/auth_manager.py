@@ -57,6 +57,14 @@ class AuthManager:
                 await self._repo.update_status(account.id, AccountStatus.DEACTIVATED, reason)
                 account.status = AccountStatus.DEACTIVATED
                 account.deactivation_reason = reason
+            else:
+                # Transient error (network/timeout) - do not deactivate, just log
+                logger.warning(
+                    "Token refresh transient error account_id=%s code=%s message=%s",
+                    account.id,
+                    exc.code,
+                    exc.message,
+                )
             raise
 
         account.access_token_encrypted = self._encryptor.encrypt(result.access_token)

@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pytest
 
-from app.core.auth.refresh import TokenRefreshResult
+from app.core.auth.refresh import RefreshError, TokenRefreshResult
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
@@ -17,6 +17,9 @@ pytestmark = pytest.mark.unit
 class _DummyRepo:
     def __init__(self) -> None:
         self.tokens_payload: dict[str, object] | None = None
+        self.status_updated = False
+        self.last_status: AccountStatus | None = None
+        self.last_deactivation_reason: str | None = None
 
     async def update_status(
         self,
@@ -24,6 +27,9 @@ class _DummyRepo:
         status: AccountStatus,
         deactivation_reason: str | None = None,
     ) -> bool:
+        self.status_updated = True
+        self.last_status = status
+        self.last_deactivation_reason = deactivation_reason
         return True
 
     async def update_tokens(
@@ -84,3 +90,68 @@ async def test_refresh_account_preserves_plan_type_when_missing(monkeypatch):
     assert updated.plan_type == "pro"
     assert repo.tokens_payload is not None
     assert repo.tokens_payload["plan_type"] == "pro"
+
+
+@pytest.mark.asyncio
+async def test_transient_error_does_not_deactivate_account(monkeypatch):
+    """Transient errors (network/timeout) should NOT deactivate the account."""
+    async def _fake_refresh_transient_error(_: str) -> None:
+        raise RefreshError("timeout", "Token refresh timed out", is_permanent=False)
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh_transient_error)
+
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_transient",
+        email="transient@example.com",
+        plan_type="pro",
+        access_token_encrypted=encryptor.encrypt("access-old"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-old"),
+        id_token_encrypted=encryptor.encrypt("id-old"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    repo = _DummyRepo()
+    manager = AuthManager(repo)
+
+    with pytest.raises(RefreshError):
+        await manager.refresh_account(account)
+
+    # Account should NOT be deactivated for transient errors
+    assert repo.status_updated is False
+    assert account.status == AccountStatus.ACTIVE
+    assert account.deactivation_reason is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_error_deactivates_account(monkeypatch):
+    """Permanent errors should deactivate the account."""
+    async def _fake_refresh_permanent_error(_: str) -> None:
+        raise RefreshError("refresh_token_expired", "Refresh token expired", is_permanent=True)
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh_permanent_error)
+
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_permanent",
+        email="permanent@example.com",
+        plan_type="pro",
+        access_token_encrypted=encryptor.encrypt("access-old"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-old"),
+        id_token_encrypted=encryptor.encrypt("id-old"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    repo = _DummyRepo()
+    manager = AuthManager(repo)
+
+    with pytest.raises(RefreshError):
+        await manager.refresh_account(account)
+
+    # Account should be deactivated for permanent errors
+    assert repo.status_updated is True
+    assert repo.last_status == AccountStatus.DEACTIVATED
+    assert account.status == AccountStatus.DEACTIVATED
+    assert account.deactivation_reason is not None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -52,6 +53,15 @@ def classify_refresh_error(code: str | None) -> bool:
     return code in PERMANENT_FAILURE_CODES
 
 
+# Network/timeout errors that should NOT deactivate accounts
+TRANSIENT_ERROR_CODES = {
+    "network_error",
+    "timeout",
+    "connection_failed",
+    "dns_error",
+}
+
+
 async def refresh_access_token(
     refresh_token: str,
     *,
@@ -72,23 +82,41 @@ async def refresh_access_token(
     request_id = get_request_id()
     if request_id:
         headers["x-request-id"] = request_id
-    async with client_session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-        data = await _safe_json(resp)
-        try:
-            payload_data = OAuthTokenPayload.model_validate(data)
-        except ValidationError as exc:
-            logger.warning(
-                "Token refresh response invalid request_id=%s",
-                get_request_id(),
-            )
-            raise RefreshError("invalid_response", "Refresh response invalid", False) from exc
-        if resp.status >= 400:
-            logger.warning(
-                "Token refresh failed request_id=%s status=%s",
-                get_request_id(),
-                resp.status,
-            )
-            raise _refresh_error_from_payload(payload_data, resp.status)
+
+    # Wrap the request in try-except to handle network/timeout errors as transient
+    try:
+        async with client_session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            data = await _safe_json(resp)
+            try:
+                payload_data = OAuthTokenPayload.model_validate(data)
+            except ValidationError as exc:
+                logger.warning(
+                    "Token refresh response invalid request_id=%s",
+                    get_request_id(),
+                )
+                raise RefreshError("invalid_response", "Refresh response invalid", False) from exc
+            if resp.status >= 400:
+                logger.warning(
+                    "Token refresh failed request_id=%s status=%s",
+                    get_request_id(),
+                    resp.status,
+                )
+                raise _refresh_error_from_payload(payload_data, resp.status)
+    except asyncio.TimeoutError as exc:
+        # Timeout is a transient error - should not deactivate account
+        logger.warning(
+            "Token refresh timed out request_id=%s",
+            get_request_id(),
+        )
+        raise RefreshError("timeout", "Token refresh timed out", False) from exc
+    except aiohttp.ClientError as exc:
+        # Network errors are transient - should not deactivate account
+        logger.warning(
+            "Token refresh network error request_id=%s error=%s",
+            get_request_id(),
+            type(exc).__name__,
+        )
+        raise RefreshError("network_error", f"Network error: {type(exc).__name__}", False) from exc
 
     if not payload_data.access_token or not payload_data.refresh_token or not payload_data.id_token:
         raise RefreshError("invalid_response", "Refresh response missing tokens", False)
@@ -107,6 +135,11 @@ async def refresh_access_token(
         plan_type=plan_type,
         email=email,
     )
+
+
+def is_transient_error(error: RefreshError) -> bool:
+    """Check if the error is transient (network/timeout) and should not deactivate the account."""
+    return error.code in TRANSIENT_ERROR_CODES
 
 
 async def _safe_json(resp: aiohttp.ClientResponse) -> JsonObject:
