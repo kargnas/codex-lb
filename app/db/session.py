@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, TypeVar
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Protocol, TypeVar
 
 import anyio
+from anyio import to_thread
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config.settings import get_settings
-from app.db.migrations import run_migrations
-from app.db.sqlite_utils import check_sqlite_integrity, sqlite_db_path_from_url
+from app.db.sqlite_utils import SqliteIntegrityCheckMode, check_sqlite_integrity, sqlite_db_path_from_url
+
+if TYPE_CHECKING:
+    from app.db.migrate import MigrationRunResult, MigrationState
 
 _settings = get_settings()
 
@@ -76,6 +80,10 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 _T = TypeVar("_T")
 
 
+class _SqliteBackupCreator(Protocol):
+    def __call__(self, source: Path, *, max_files: int) -> Path: ...
+
+
 def _ensure_sqlite_dir(url: str) -> None:
     if not (url.startswith("sqlite+aiosqlite:") or url.startswith("sqlite:")):
         return
@@ -95,6 +103,12 @@ def _ensure_sqlite_dir(url: str) -> None:
         return
 
     Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
+def _startup_sqlite_check_mode(raw_mode: str) -> SqliteIntegrityCheckMode | None:
+    if raw_mode == "off":
+        return None
+    return SqliteIntegrityCheckMode(raw_mode)
 
 
 async def _shielded(awaitable: Awaitable[_T]) -> _T:
@@ -118,6 +132,37 @@ async def _safe_close(session: AsyncSession) -> None:
         return
 
 
+def _load_migration_entrypoints() -> tuple[
+    Callable[[str], "MigrationState"],
+    Callable[[str], Awaitable["MigrationRunResult"]],
+    Callable[[str], tuple[str, ...]],
+]:
+    from app.db.migrate import check_schema_drift, inspect_migration_state, run_startup_migrations
+
+    return inspect_migration_state, run_startup_migrations, check_schema_drift
+
+
+def _load_sqlite_backup_creator() -> _SqliteBackupCreator:
+    from app.db.backup import create_sqlite_pre_migration_backup
+
+    return create_sqlite_pre_migration_backup
+
+
+@asynccontextmanager
+async def get_background_session() -> AsyncIterator[AsyncSession]:
+    """Session provider for background tasks, schedulers, and auth dependencies."""
+    session = SessionLocal()
+    try:
+        yield session
+    except BaseException:
+        await _safe_rollback(session)
+        raise
+    finally:
+        if session.in_transaction():
+            await _safe_rollback(session)
+        await _safe_close(session)
+
+
 async def get_session() -> AsyncIterator[AsyncSession]:
     session = SessionLocal()
     try:
@@ -132,42 +177,94 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db() -> None:
-    from app.db.models import Base
-
     _ensure_sqlite_dir(_settings.database_url)
     sqlite_path = sqlite_db_path_from_url(_settings.database_url)
     if sqlite_path is not None:
-        integrity = check_sqlite_integrity(sqlite_path)
-        if not integrity.ok:
-            details = integrity.details or "unknown error"
-            logger.error("SQLite integrity check failed path=%s details=%s", sqlite_path, details)
-            if "locked" in details.lower():
-                message = (
-                    f"SQLite integrity check failed for {sqlite_path} ({details}). "
-                    "Another instance may be running. Stop it and retry."
+        check_mode = _startup_sqlite_check_mode(_settings.database_sqlite_startup_check_mode)
+        if check_mode is not None:
+            integrity = check_sqlite_integrity(sqlite_path, mode=check_mode)
+            if not integrity.ok:
+                details = integrity.details or "unknown error"
+                pragma_name = "quick_check" if check_mode == SqliteIntegrityCheckMode.QUICK else "integrity_check"
+                logger.error(
+                    "SQLite %s failed path=%s details=%s",
+                    pragma_name,
+                    sqlite_path,
+                    details,
                 )
-            else:
-                message = (
-                    f"SQLite integrity check failed for {sqlite_path} ({details}). "
-                    "The database appears corrupted or the filesystem is unhealthy. "
-                    "Stop the app and run "
-                    f'`python -m app.db.recover --db "{sqlite_path}" --replace` '
-                    "or restore a backup from the same directory."
-                )
-            raise RuntimeError(message)
+                if "locked" in details.lower():
+                    message = (
+                        f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
+                        "Another instance may be running. Stop it and retry."
+                    )
+                else:
+                    message = (
+                        f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
+                        "The database appears corrupted or the filesystem is unhealthy. "
+                        "Stop the app and run "
+                        f'`python -m app.db.recover --db "{sqlite_path}" --replace` '
+                        "or restore a backup from the same directory."
+                    )
+                raise RuntimeError(message)
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if not _settings.database_migrate_on_startup:
+        logger.info("Startup database migration is disabled")
+        return
 
-    async with SessionLocal() as session:
-        try:
-            updated = await run_migrations(session)
-            if updated:
-                logger.info("Applied database migrations count=%s", updated)
-        except Exception:
-            logger.exception("Failed to apply database migrations")
-            if get_settings().database_migrations_fail_fast:
-                raise
+    try:
+        inspect_migration_state, run_startup_migrations, check_schema_drift = _load_migration_entrypoints()
+    except ModuleNotFoundError as exc:
+        if exc.name != "app.db.migrate":
+            raise
+        logger.exception("Failed to import migration entrypoint module=app.db.migrate")
+        raise RuntimeError("Database migration entrypoint app.db.migrate is unavailable") from exc
+    except ImportError as exc:
+        logger.exception("Failed to import database migration entrypoints from app.db.migrate")
+        raise RuntimeError("Database migration entrypoint app.db.migrate is invalid") from exc
+
+    if sqlite_path is not None and _settings.database_sqlite_pre_migrate_backup_enabled and sqlite_path.exists():
+        migration_state = await to_thread.run_sync(
+            lambda: inspect_migration_state(_settings.database_url),
+        )
+        if migration_state.needs_upgrade:
+            try:
+                create_sqlite_pre_migration_backup = _load_sqlite_backup_creator()
+            except ModuleNotFoundError as exc:
+                if exc.name != "app.db.backup":
+                    raise
+                logger.exception("Failed to import SQLite backup module=app.db.backup")
+                raise RuntimeError("SQLite backup module app.db.backup is unavailable") from exc
+
+            backup_path = await to_thread.run_sync(
+                lambda: create_sqlite_pre_migration_backup(
+                    sqlite_path,
+                    max_files=_settings.database_sqlite_pre_migrate_backup_max_files,
+                ),
+            )
+            logger.info(
+                "Created SQLite pre-migration backup path=%s target_revision=%s",
+                backup_path,
+                migration_state.head_revision,
+            )
+
+    try:
+        result = await run_startup_migrations(_settings.database_url)
+        if result.bootstrap.stamped_revision is not None:
+            logger.info(
+                "Bootstrapped legacy migrations stamped_revision=%s legacy_rows=%s",
+                result.bootstrap.stamped_revision,
+                result.bootstrap.legacy_row_count,
+            )
+        if result.current_revision is not None:
+            logger.info("Database migration complete revision=%s", result.current_revision)
+        drift = await to_thread.run_sync(lambda: check_schema_drift(_settings.database_url))
+        if drift:
+            drift_details = "; ".join(drift)
+            raise RuntimeError(f"Schema drift detected after startup migrations: {drift_details}")
+    except Exception:
+        logger.exception("Failed to apply database migrations")
+        if _settings.database_migrations_fail_fast:
+            raise
 
 
 async def close_db() -> None:

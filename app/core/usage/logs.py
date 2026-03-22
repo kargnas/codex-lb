@@ -6,11 +6,18 @@ from app.core.usage.pricing import UsageTokens, calculate_cost_from_usage, get_p
 
 
 class RequestLogLike(Protocol):
-    model: str | None
-    input_tokens: int | None
-    output_tokens: int | None
-    cached_input_tokens: int | None
-    reasoning_tokens: int | None
+    @property
+    def model(self) -> str | None: ...
+    @property
+    def service_tier(self) -> str | None: ...
+    @property
+    def input_tokens(self) -> int | None: ...
+    @property
+    def output_tokens(self) -> int | None: ...
+    @property
+    def cached_input_tokens(self) -> int | None: ...
+    @property
+    def reasoning_tokens(self) -> int | None: ...
 
 
 def cached_input_tokens_from_log(log: RequestLogLike) -> int | None:
@@ -49,7 +56,7 @@ def cost_from_log(log: RequestLogLike, *, precision: int | None = None) -> float
     if not resolved:
         return None
     _, price = resolved
-    cost = calculate_cost_from_usage(usage, price)
+    cost = calculate_cost_from_usage(usage, price, service_tier=log.service_tier)
     if cost is None:
         return None
     if precision is None:

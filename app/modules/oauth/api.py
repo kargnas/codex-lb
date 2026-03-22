@@ -3,10 +3,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends
 from fastapi.responses import JSONResponse
 
+from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
 from app.core.clients.oauth import OAuthError
 from app.core.errors import dashboard_error
 from app.dependencies import OauthContext, get_oauth_context
 from app.modules.oauth.schemas import (
+    ManualCallbackRequest,
+    ManualCallbackResponse,
     OauthCompleteRequest,
     OauthCompleteResponse,
     OauthStartRequest,
@@ -14,7 +17,11 @@ from app.modules.oauth.schemas import (
     OauthStatusResponse,
 )
 
-router = APIRouter(prefix="/api/oauth", tags=["dashboard"])
+router = APIRouter(
+    prefix="/api/oauth",
+    tags=["dashboard"],
+    dependencies=[Depends(validate_dashboard_session), Depends(set_dashboard_error_format)],
+)
 
 
 @router.post("/start", response_model=OauthStartResponse)
@@ -54,4 +61,18 @@ async def complete_oauth(
         return JSONResponse(
             status_code=501,
             content=dashboard_error("not_implemented", "OAuth complete is not implemented"),
+        )
+
+
+@router.post("/manual-callback", response_model=ManualCallbackResponse)
+async def manual_callback(
+    request: ManualCallbackRequest,
+    context: OauthContext = Depends(get_oauth_context),
+) -> ManualCallbackResponse | JSONResponse:
+    try:
+        return await context.service.manual_callback(request.callback_url)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content=dashboard_error("manual_callback_failed", str(exc)),
         )

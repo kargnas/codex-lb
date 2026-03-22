@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from typing import cast
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from app.core import usage as usage_core
 from app.core.usage.logs import (
-    RequestLogLike,
     cached_input_tokens_from_log,
     total_tokens_from_log,
     usage_tokens_from_log,
 )
-from app.core.usage.pricing import CostItem, calculate_costs
+from app.core.usage.pricing import CostItem, UsageTokens, calculate_costs
 from app.core.usage.types import (
+    BucketModelAggregate,
     UsageCostSummary,
     UsageMetricsSummary,
     UsageSummaryPayload,
@@ -18,10 +20,11 @@ from app.core.usage.types import (
     UsageWindowSnapshot,
 )
 from app.core.utils.time import from_epoch_seconds
-from app.db.models import Account, RequestLog
+from app.db.models import Account, AdditionalUsageHistory, RequestLog
 from app.modules.usage.schemas import (
+    MetricsTrends,
+    TrendPoint,
     UsageCost,
-    UsageCostByModel,
     UsageHistoryItem,
     UsageHistoryResponse,
     UsageMetrics,
@@ -29,6 +32,121 @@ from app.modules.usage.schemas import (
     UsageWindow,
     UsageWindowResponse,
 )
+
+_BUCKET_COUNT = 28
+_BUCKET_SECONDS = 21600  # 6 hours
+
+
+def build_trends_from_buckets(
+    rows: list[BucketModelAggregate],
+    since: datetime,
+    bucket_seconds: int = _BUCKET_SECONDS,
+    bucket_count: int = _BUCKET_COUNT,
+) -> tuple[MetricsTrends, UsageMetricsSummary, UsageCostSummary]:
+    since_epoch = (
+        int(since.replace(tzinfo=timezone.utc).timestamp()) if since.tzinfo is None else int(since.timestamp())
+    )
+    # Align slots so the last slot contains "now" (since + window).
+    # Use floor to snap since to a bucket boundary, then shift by 1
+    # so that recent data falls within the slot range.
+    first_bucket = (since_epoch // bucket_seconds) * bucket_seconds + bucket_seconds
+    slots = [first_bucket + i * bucket_seconds for i in range(bucket_count)]
+    slot_set = set(slots)
+
+    # Accumulate per-bucket values
+    bucket_requests: dict[int, int] = defaultdict(int)
+    bucket_errors: dict[int, int] = defaultdict(int)
+    bucket_tokens: dict[int, int] = defaultdict(int)
+    bucket_cost_items: dict[int, list[CostItem]] = defaultdict(list)
+
+    total_requests = 0
+    total_errors = 0
+    total_tokens = 0
+    total_cached_tokens = 0
+
+    for row in rows:
+        epoch = row.bucket_epoch
+        if epoch not in slot_set:
+            continue
+        bucket_requests[epoch] += row.request_count
+        bucket_errors[epoch] += row.error_count
+        bucket_tokens[epoch] += row.input_tokens + row.output_tokens
+        bucket_cost_items[epoch].append(
+            CostItem(
+                model=row.model,
+                service_tier=row.service_tier,
+                usage=UsageTokens(
+                    input_tokens=float(row.input_tokens),
+                    output_tokens=float(row.output_tokens),
+                    cached_input_tokens=float(row.cached_input_tokens),
+                ),
+            )
+        )
+
+        total_requests += row.request_count
+        total_errors += row.error_count
+        total_tokens += row.input_tokens + row.output_tokens
+        total_cached_tokens += row.cached_input_tokens
+
+    requests_points: list[TrendPoint] = []
+    tokens_points: list[TrendPoint] = []
+    cost_points: list[TrendPoint] = []
+    error_rate_points: list[TrendPoint] = []
+
+    for epoch in slots:
+        t = datetime.fromtimestamp(epoch, tz=timezone.utc)
+        req = bucket_requests.get(epoch, 0)
+        err = bucket_errors.get(epoch, 0)
+        tok = bucket_tokens.get(epoch, 0)
+
+        cost_value = 0.0
+        if epoch in bucket_cost_items:
+            cost_summary = calculate_costs(bucket_cost_items[epoch])
+            cost_value = cost_summary.total_usd_7d
+
+        err_rate = (err / req) if req > 0 else 0.0
+
+        requests_points.append(TrendPoint(t=t, v=float(req)))
+        tokens_points.append(TrendPoint(t=t, v=float(tok)))
+        cost_points.append(TrendPoint(t=t, v=round(cost_value, 6)))
+        error_rate_points.append(TrendPoint(t=t, v=round(err_rate, 4)))
+
+    trends = MetricsTrends(
+        requests=requests_points,
+        tokens=tokens_points,
+        cost=cost_points,
+        error_rate=error_rate_points,
+    )
+
+    error_rate_total: float | None = None
+    if total_requests > 0:
+        error_rate_total = total_errors / total_requests
+
+    metrics = UsageMetricsSummary(
+        requests_7d=total_requests,
+        tokens_secondary_window=total_tokens,
+        cached_tokens_secondary_window=total_cached_tokens,
+        error_rate_7d=error_rate_total,
+        top_error=None,
+    )
+
+    # Compute total cost from all rows
+    all_cost_items = [
+        CostItem(
+            model=row.model,
+            service_tier=row.service_tier,
+            usage=UsageTokens(
+                input_tokens=float(row.input_tokens),
+                output_tokens=float(row.output_tokens),
+                cached_input_tokens=float(row.cached_input_tokens),
+            ),
+        )
+        for row in rows
+        if row.bucket_epoch in slot_set
+    ]
+    total_cost = calculate_costs(all_cost_items)
+
+    return trends, metrics, total_cost
 
 
 def build_usage_summary_response(
@@ -40,6 +158,8 @@ def build_usage_summary_response(
     spark_secondary_rows: list[UsageWindowRow],
     spark_window_label: str | None,
     logs_secondary: list[RequestLog],
+    metrics_override: UsageMetricsSummary | None = None,
+    cost_override: UsageCostSummary | None = None,
 ) -> UsageSummaryResponse:
     account_map = {account.id: account for account in accounts}
     primary_window = usage_core.summarize_usage_window(primary_rows, account_map, "primary")
@@ -55,9 +175,13 @@ def build_usage_summary_response(
         "spark_secondary",
     )
 
-    cost_items = [item for item in (_log_to_cost_item(log) for log in logs_secondary) if item]
-    cost = calculate_costs(cost_items)
-    metrics = _usage_metrics(logs_secondary)
+    if cost_override is not None:
+        cost = cost_override
+    else:
+        cost_items = [item for item in (_log_to_cost_item(log) for log in logs_secondary) if item]
+        cost = calculate_costs(cost_items)
+
+    metrics = metrics_override if metrics_override is not None else _usage_metrics(logs_secondary)
 
     payload = usage_core.parse_usage_summary(
         primary_window,
@@ -81,7 +205,12 @@ def build_usage_history_response(
     window: str,
 ) -> UsageHistoryResponse:
     account_map = {account.id: account for account in accounts}
-    accounts_history = _build_account_history(usage_rows, account_map, window)
+    accounts_history = _build_account_history(
+        usage_rows,
+        account_map,
+        window,
+        missing_remaining_percent=100.0,
+    )
     return UsageHistoryResponse(window_hours=hours, accounts=accounts_history)
 
 
@@ -93,7 +222,12 @@ def build_usage_window_response(
     accounts: list[Account],
 ) -> UsageWindowResponse:
     account_map = {account.id: account for account in accounts}
-    accounts_history = _build_account_history(usage_rows, account_map, window_key)
+    accounts_history = _build_account_history(
+        usage_rows,
+        account_map,
+        window_key,
+        missing_remaining_percent=None,
+    )
     return UsageWindowResponse(
         window_key=window_key,
         window_minutes=window_minutes,
@@ -105,6 +239,8 @@ def _build_account_history(
     usage_rows: list[UsageWindowRow],
     account_map: dict[str, Account],
     window: str,
+    *,
+    missing_remaining_percent: float | None,
 ) -> list[UsageHistoryItem]:
     # Spark windows should only include accounts that actually reported Spark usage.
     # Otherwise Spark-ineligible accounts are rendered as 100% remaining.
@@ -118,17 +254,20 @@ def _build_account_history(
             continue
 
         used_percent = usage.used_percent if usage else None
-        used_percent_value = float(used_percent) if used_percent is not None else 0.0
-        remaining_percent = usage_core.remaining_percent_from_used(used_percent_value) or 0.0
+        used_percent_value = float(used_percent) if used_percent is not None else None
+        remaining_percent = usage_core.remaining_percent_from_used(used_percent_value)
+        if remaining_percent is None:
+            remaining_percent = missing_remaining_percent
         capacity = usage_core.capacity_for_plan(account.plan_type, window)
-        remaining_credits = usage_core.remaining_credits_from_percent(used_percent_value, capacity) or 0.0
+        remaining_credits = usage_core.remaining_credits_from_percent(used_percent_value, capacity)
+        if remaining_credits is None and missing_remaining_percent is not None:
+            remaining_credits = capacity
         results.append(
             UsageHistoryItem(
                 account_id=account_id,
-                email=account.email,
                 remaining_percent_avg=remaining_percent,
                 capacity_credits=float(capacity or 0.0),
-                remaining_credits=float(remaining_credits),
+                remaining_credits=float(remaining_credits or 0.0),
             )
         )
     return results
@@ -136,10 +275,10 @@ def _build_account_history(
 
 def _log_to_cost_item(log: RequestLog) -> CostItem | None:
     model = log.model
-    usage = usage_tokens_from_log(cast(RequestLogLike, log))
+    usage = usage_tokens_from_log(log)
     if not model or not usage:
         return None
-    return CostItem(model=model, usage=usage)
+    return CostItem(model=model, usage=usage, service_tier=log.service_tier)
 
 
 def _usage_metrics(logs_secondary: list[RequestLog]) -> UsageMetricsSummary:
@@ -163,14 +302,14 @@ def _usage_metrics(logs_secondary: list[RequestLog]) -> UsageMetricsSummary:
 def _sum_tokens(logs: list[RequestLog]) -> int:
     total = 0
     for log in logs:
-        total += total_tokens_from_log(cast(RequestLogLike, log)) or 0
+        total += total_tokens_from_log(log) or 0
     return total
 
 
 def _sum_cached_input_tokens(logs: list[RequestLog]) -> int:
     total = 0
     for log in logs:
-        total += cached_input_tokens_from_log(cast(RequestLogLike, log)) or 0
+        total += cached_input_tokens_from_log(log) or 0
     return total
 
 
@@ -219,7 +358,6 @@ def _cost_summary_to_model(cost: UsageCostSummary) -> UsageCost:
     return UsageCost(
         currency=cost.currency,
         totalUsd7d=cost.total_usd_7d,
-        by_model=[UsageCostByModel(model=item.model, usd=item.usd) for item in cost.by_model],
     )
 
 
@@ -231,3 +369,105 @@ def _metrics_summary_to_model(metrics: UsageMetricsSummary) -> UsageMetrics:
         error_rate_7d=metrics.error_rate_7d,
         top_error=metrics.top_error,
     )
+
+
+# ---------------------------------------------------------------------------
+# Additional usage aggregation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdditionalWindowSummary:
+    """Summary for one window (primary or secondary) of an additional rate limit."""
+
+    used_percent: float  # average across accounts
+    reset_at: int | None  # max reset_at across accounts
+    window_minutes: int | None  # max window_minutes
+
+
+@dataclass(frozen=True)
+class AdditionalQuotaSummary:
+    """Aggregated summary for one additional rate limit (e.g., codex_other)."""
+
+    limit_name: str
+    metered_feature: str
+    primary_window: AdditionalWindowSummary | None
+    secondary_window: AdditionalWindowSummary | None
+
+
+def build_additional_usage_summary(
+    additional_usage_data: dict[str, dict[str, dict[str, AdditionalUsageHistory]]],
+) -> list[AdditionalQuotaSummary]:
+    """Build aggregated additional quota summaries from per-account data.
+
+    Args:
+        additional_usage_data: Nested mapping of
+            ``limit_name -> window_key -> account_id -> AdditionalUsageHistory``.
+
+    Returns:
+        One :class:`AdditionalQuotaSummary` per *limit_name* present in the input.
+    """
+    results: list[AdditionalQuotaSummary] = []
+
+    for limit_name, windows in additional_usage_data.items():
+        primary_entries = windows.get("primary", {})
+        secondary_entries = windows.get("secondary", {})
+
+        # Derive metered_feature from any available entry
+        metered_feature = _metered_feature_from_entries(primary_entries, secondary_entries)
+
+        primary_window = _aggregate_additional_window(primary_entries)
+        secondary_window = _aggregate_additional_window(secondary_entries)
+
+        results.append(
+            AdditionalQuotaSummary(
+                limit_name=limit_name,
+                metered_feature=metered_feature,
+                primary_window=primary_window,
+                secondary_window=secondary_window,
+            )
+        )
+
+    return results
+
+
+def _aggregate_additional_window(
+    entries: dict[str, AdditionalUsageHistory],
+) -> AdditionalWindowSummary | None:
+    """Aggregate per-account entries into a single window summary.
+
+    Averaging ``used_percent``, using the earliest ``reset_at`` (min) and the
+    largest ``window_minutes`` (max) for consistent pool behavior.
+    """
+    if not entries:
+        return None
+
+    total_percent = 0.0
+    count = 0
+    reset_candidates: list[int] = []
+    wm_candidates: list[int] = []
+
+    for entry in entries.values():
+        total_percent += entry.used_percent
+        count += 1
+        if entry.reset_at is not None:
+            reset_candidates.append(entry.reset_at)
+        if entry.window_minutes is not None:
+            wm_candidates.append(entry.window_minutes)
+
+    return AdditionalWindowSummary(
+        used_percent=total_percent / count,
+        reset_at=min(reset_candidates) if reset_candidates else None,
+        window_minutes=max(wm_candidates) if wm_candidates else None,
+    )
+
+
+def _metered_feature_from_entries(
+    primary: dict[str, AdditionalUsageHistory],
+    secondary: dict[str, AdditionalUsageHistory],
+) -> str:
+    """Extract ``metered_feature`` from the first available entry."""
+    for entries in (primary, secondary):
+        for entry in entries.values():
+            return entry.metered_feature
+    return ""

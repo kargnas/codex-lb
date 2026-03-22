@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -33,6 +34,7 @@ class ChatChunkDelta(BaseModel):
 
     role: str | None = None
     content: str | None = None
+    refusal: str | None = None
     tool_calls: list[ChatToolCallDelta] | None = None
 
 
@@ -68,6 +70,7 @@ class ChatCompletionMessage(BaseModel):
 
     role: str
     content: str | None = None
+    refusal: str | None = None
     tool_calls: list[ChatMessageToolCall] | None = None
 
 
@@ -85,6 +88,20 @@ class ChatCompletionUsage(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    prompt_tokens_details: "ChatPromptTokensDetails | None" = None
+    completion_tokens_details: "ChatCompletionTokensDetails | None" = None
+
+
+class ChatPromptTokensDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cached_tokens: int | None = None
+
+
+class ChatCompletionTokensDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning_tokens: int | None = None
 
 
 class ChatCompletion(BaseModel):
@@ -196,10 +213,20 @@ def iter_chat_chunks(
             continue
         event_type = payload.get("type")
         if event_type in ("response.output_text.delta", "response.refusal.delta"):
-            delta = payload.get("delta")
+            delta_text = payload.get("delta")
             role = None
             if not state.sent_role:
                 role = "assistant"
+            if event_type == "response.refusal.delta":
+                delta_obj = ChatChunkDelta(
+                    role=role,
+                    refusal=delta_text if isinstance(delta_text, str) else None,
+                )
+            else:
+                delta_obj = ChatChunkDelta(
+                    role=role,
+                    content=delta_text if isinstance(delta_text, str) else None,
+                )
             chunk = ChatCompletionChunk(
                 id="chatcmpl_temp",
                 created=created,
@@ -207,10 +234,7 @@ def iter_chat_chunks(
                 choices=[
                     ChatChunkChoice(
                         index=0,
-                        delta=ChatChunkDelta(
-                            role=role,
-                            content=delta if isinstance(delta, str) else None,
-                        ),
+                        delta=delta_obj,
                         finish_reason=None,
                     )
                 ],
@@ -255,7 +279,7 @@ def iter_chat_chunks(
                 if isinstance(maybe_error, dict):
                     error = maybe_error
             if error is not None:
-                error_payload = {"error": error}
+                error_payload: dict[str, JsonValue] = {"error": error}
                 yield _dump_sse(error_payload)
                 yield "data: [DONE]\n\n"
                 return
@@ -318,6 +342,7 @@ async def stream_chat_chunks(
 async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> ChatCompletionResult:
     created = int(time.time())
     content_parts: list[str] = []
+    refusal_parts: list[str] = []
     response_id: str | None = None
     usage: ResponseUsage | None = None
     incomplete_reason: str | None = None
@@ -329,10 +354,14 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
         if not payload:
             continue
         event_type = payload.get("type")
-        if event_type in ("response.output_text.delta", "response.refusal.delta"):
+        if event_type == "response.output_text.delta":
             delta = payload.get("delta")
             if isinstance(delta, str):
                 content_parts.append(delta)
+        if event_type == "response.refusal.delta":
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                refusal_parts.append(delta)
         tool_delta = _tool_call_delta_from_payload(payload, tool_index)
         if tool_delta is not None:
             _merge_tool_call_delta(tool_calls, tool_delta)
@@ -361,13 +390,17 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
                 if event_type == "response.incomplete":
                     incomplete_reason = _finish_reason_from_incomplete(response)
 
-    message_content = "".join(content_parts)
+    message_content: str | None = "".join(content_parts)
+    message_refusal = "".join(refusal_parts) or None
     message_tool_calls = _compact_tool_calls(tool_calls)
     has_tool_calls = bool(message_tool_calls)
     finish_reason = "tool_calls" if has_tool_calls else (incomplete_reason or "stop")
+    if (has_tool_calls or message_refusal) and not message_content:
+        message_content = None
     message = ChatCompletionMessage(
         role="assistant",
-        content=message_content if message_content or not has_tool_calls else None,
+        content=message_content,
+        refusal=message_refusal,
         tool_calls=message_tool_calls or None,
     )
     choice = ChatCompletionChoice(
@@ -393,10 +426,21 @@ def _map_usage(usage: ResponseUsage | None) -> ChatCompletionUsage | None:
     total_tokens = usage.total_tokens
     if prompt_tokens is None and completion_tokens is None and total_tokens is None:
         return None
+    prompt_details = None
+    cached_tokens = usage.input_tokens_details.cached_tokens if usage.input_tokens_details else None
+    if cached_tokens is not None:
+        prompt_details = ChatPromptTokensDetails(cached_tokens=cached_tokens)
+
+    completion_details = None
+    reasoning_tokens = usage.output_tokens_details.reasoning_tokens if usage.output_tokens_details else None
+    if reasoning_tokens is not None:
+        completion_details = ChatCompletionTokensDetails(reasoning_tokens=reasoning_tokens)
     return ChatCompletionUsage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
+        prompt_tokens_details=prompt_details,
+        completion_tokens_details=completion_details,
     )
 
 
@@ -421,12 +465,13 @@ def _dump_sse(payload: dict[str, JsonValue]) -> str:
 
 
 def _finish_reason_from_incomplete(response: JsonValue | None) -> str:
-    if not is_json_mapping(response):
+    response_mapping = _as_mapping(response)
+    if response_mapping is None:
         return "stop"
-    details = response.get("incomplete_details")
-    if is_json_mapping(details):
+    details = _as_mapping(response_mapping.get("incomplete_details"))
+    if details is not None:
         reason = details.get("reason")
-        if reason == "max_output_tokens":
+        if reason in ("max_output_tokens", "max_tokens"):
             return "length"
         if reason == "content_filter":
             return "content_filter"
@@ -595,7 +640,7 @@ def _tool_call_key(call_id: str | None, name: str | None) -> str | None:
 
 def _as_mapping(value: JsonValue) -> Mapping[str, JsonValue] | None:
     if is_json_mapping(value):
-        return value
+        return cast(Mapping[str, JsonValue], value)
     return None
 
 

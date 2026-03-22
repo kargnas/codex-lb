@@ -153,6 +153,29 @@ def test_select_account_skips_rate_limited_until_reset():
     assert result.account.account_id == "b"
 
 
+def test_select_account_round_robin_prefers_least_recently_selected():
+    now = 1_700_000_000.0
+    states = [
+        AccountState("a", AccountStatus.ACTIVE, used_percent=90.0, last_selected_at=now - 2),
+        AccountState("b", AccountStatus.ACTIVE, used_percent=10.0, last_selected_at=now - 30),
+        AccountState("c", AccountStatus.ACTIVE, used_percent=5.0, last_selected_at=now - 5),
+    ]
+    result = select_account(states, now=now, routing_strategy="round_robin")
+    assert result.account is not None
+    assert result.account.account_id == "b"
+
+
+def test_select_account_round_robin_prefers_never_selected():
+    now = 1_700_000_000.0
+    states = [
+        AccountState("a", AccountStatus.ACTIVE, used_percent=1.0, last_selected_at=now - 1),
+        AccountState("b", AccountStatus.ACTIVE, used_percent=99.0, last_selected_at=None),
+    ]
+    result = select_account(states, now=now, routing_strategy="round_robin")
+    assert result.account is not None
+    assert result.account.account_id == "b"
+
+
 def test_handle_rate_limit_sets_reset_at_from_message(monkeypatch):
     now = 1_700_000_000.0
     monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
@@ -303,3 +326,54 @@ def test_apply_usage_quota_resets_to_active_if_runtime_reset_expired(monkeypatch
     assert status == AccountStatus.ACTIVE
     assert used_percent == 50.0
     assert reset_at is None
+
+
+def test_error_backoff_resets_error_count_when_expired():
+    now = 1_700_000_000.0
+    state = AccountState(
+        "a",
+        AccountStatus.ACTIVE,
+        used_percent=5.0,
+        error_count=7,
+        last_error_at=now - 400,
+    )
+    result = select_account([state], now=now)
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    assert state.error_count == 0
+    assert state.last_error_at is None
+
+
+def test_error_backoff_does_not_reset_when_still_active():
+    now = 1_700_000_000.0
+    state = AccountState(
+        "a",
+        AccountStatus.ACTIVE,
+        used_percent=5.0,
+        error_count=5,
+        last_error_at=now - 60,
+    )
+    result = select_account([state], now=now)
+    assert result.account is None
+    assert state.error_count == 5
+
+
+def test_error_backoff_expired_account_does_not_immediately_relock():
+    now = 1_700_000_000.0
+    state = AccountState(
+        "a",
+        AccountStatus.ACTIVE,
+        used_percent=5.0,
+        error_count=7,
+        last_error_at=now - 400,
+    )
+    result = select_account([state], now=now)
+    assert result.account is not None
+    assert state.error_count == 0
+
+    state.error_count = 2
+    state.last_error_at = now + 1
+
+    result2 = select_account([state], now=now + 2)
+    assert result2.account is not None
+    assert result2.account.account_id == "a"

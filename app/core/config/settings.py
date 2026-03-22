@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import socket
 from functools import lru_cache
+from ipaddress import ip_network
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parents[3]
@@ -29,6 +31,11 @@ def _default_oauth_callback_host() -> str:
     return "127.0.0.1"
 
 
+def _default_http_bridge_instance_id() -> str:
+    hostname = socket.gethostname().strip()
+    return hostname or "codex-lb"
+
+
 DEFAULT_HOME_DIR = _default_home_dir()
 DEFAULT_DB_PATH = DEFAULT_HOME_DIR / "store.db"
 DEFAULT_ENCRYPTION_KEY_FILE = DEFAULT_HOME_DIR / "encryption.key"
@@ -46,32 +53,65 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(default=15, gt=0)
     database_max_overflow: int = Field(default=10, ge=0)
     database_pool_timeout_seconds: float = Field(default=30.0, gt=0)
+    database_migrate_on_startup: bool = True
+    database_sqlite_pre_migrate_backup_enabled: bool = True
+    database_sqlite_pre_migrate_backup_max_files: int = Field(default=5, ge=1)
+    database_sqlite_startup_check_mode: Literal["quick", "full", "off"] = "quick"
+    database_alembic_auto_remap_enabled: bool = True
     upstream_base_url: str = "https://chatgpt.com/backend-api"
-    upstream_connect_timeout_seconds: float = 30.0
+    upstream_stream_transport: Literal["http", "websocket", "auto"] = "auto"
+    upstream_connect_timeout_seconds: float = 8.0
+    upstream_compact_timeout_seconds: float | None = None
+    upstream_websocket_trust_env: bool = False
+    proxy_request_budget_seconds: float = Field(default=600.0, gt=0)
+    compact_request_budget_seconds: float = Field(default=75.0, gt=0)
     stream_idle_timeout_seconds: float = 300.0
     max_sse_event_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
     auth_base_url: str = "https://auth.openai.com"
     oauth_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+    oauth_originator: str = "codex_chatgpt_desktop"
     oauth_scope: str = "openid profile email"
     oauth_timeout_seconds: float = 30.0
     oauth_redirect_uri: str = "http://localhost:1455/auth/callback"
     oauth_callback_host: str = _default_oauth_callback_host()
     oauth_callback_port: int = 1455  # Do not change the port. OpenAI dislikes changes.
-    token_refresh_timeout_seconds: float = 30.0
+    token_refresh_timeout_seconds: float = 8.0
+    transcription_request_budget_seconds: float = Field(default=120.0, gt=0)
     token_refresh_interval_days: int = 8
     usage_fetch_timeout_seconds: float = 10.0
     usage_fetch_max_retries: int = 2
     usage_refresh_enabled: bool = True
     usage_refresh_interval_seconds: int = Field(default=60, gt=0)
+    openai_cache_affinity_max_age_seconds: int = Field(default=1800, gt=0)
+    openai_prompt_cache_key_derivation_enabled: bool = True
+    http_responses_session_bridge_enabled: bool = True
+    http_responses_session_bridge_idle_ttl_seconds: float = Field(default=120.0, gt=0)
+    http_responses_session_bridge_codex_idle_ttl_seconds: float = Field(default=900.0, gt=0)
+    http_responses_session_bridge_codex_prewarm_enabled: bool = False
+    http_responses_session_bridge_max_sessions: int = Field(default=256, gt=0)
+    http_responses_session_bridge_queue_limit: int = Field(default=8, gt=0)
+    http_responses_session_bridge_instance_id: str = Field(default_factory=_default_http_bridge_instance_id)
+    http_responses_session_bridge_instance_ring: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    sticky_session_cleanup_enabled: bool = True
+    sticky_session_cleanup_interval_seconds: int = Field(default=300, gt=0)
     encryption_key_file: Path = DEFAULT_ENCRYPTION_KEY_FILE
     database_migrations_fail_fast: bool = True
     log_proxy_request_shape: bool = False
     log_proxy_request_shape_raw_cache_key: bool = False
     log_proxy_request_payload: bool = False
+    log_proxy_service_tier_trace: bool = False
+    log_upstream_request_summary: bool = False
+    log_upstream_request_payload: bool = False
     max_decompressed_body_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     image_inline_fetch_enabled: bool = True
     image_inline_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    dashboard_setup_token: str | None = None
+    model_registry_enabled: bool = True
+    model_registry_refresh_interval_seconds: int = Field(default=300, gt=0)
+    model_registry_client_version: str = "0.101.0"
+    firewall_trust_proxy_headers: bool = False
+    firewall_trusted_proxy_cidrs: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["127.0.0.1/32", "::1/128"]
+    )
 
     @field_validator("database_url")
     @classmethod
@@ -109,6 +149,68 @@ class Settings(BaseSettings):
                         normalized.append(host)
             return normalized
         raise TypeError("image_inline_allowed_hosts must be a list or comma-separated string")
+
+    @field_validator("firewall_trusted_proxy_cidrs", mode="before")
+    @classmethod
+    def _normalize_firewall_trusted_proxy_cidrs(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        cidrs: list[str] = []
+        if isinstance(value, str):
+            entries = [entry.strip() for entry in value.split(",")]
+            cidrs = [entry for entry in entries if entry]
+        elif isinstance(value, list):
+            for entry in value:
+                if isinstance(entry, str):
+                    cidr = entry.strip()
+                    if cidr:
+                        cidrs.append(cidr)
+        else:
+            raise TypeError("firewall_trusted_proxy_cidrs must be a list or comma-separated string")
+
+        for cidr in cidrs:
+            try:
+                ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"Invalid firewall trusted proxy CIDR: {cidr}") from exc
+        return cidrs
+
+    @field_validator("http_responses_session_bridge_instance_ring", mode="before")
+    @classmethod
+    def _normalize_http_bridge_instance_ring(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            entries = [entry.strip() for entry in value.split(",")]
+            return [entry for entry in entries if entry]
+        if isinstance(value, list):
+            normalized: list[str] = []
+            for entry in value:
+                if isinstance(entry, str):
+                    instance_id = entry.strip()
+                    if instance_id:
+                        normalized.append(instance_id)
+            return normalized
+        raise TypeError("http_responses_session_bridge_instance_ring must be a list or comma-separated string")
+
+    @field_validator("upstream_compact_timeout_seconds")
+    @classmethod
+    def _validate_upstream_compact_timeout_seconds(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("upstream_compact_timeout_seconds must be greater than zero")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_http_bridge_instance_configuration(self) -> "Settings":
+        ring = self.http_responses_session_bridge_instance_ring
+        if ring and self.http_responses_session_bridge_instance_id not in ring:
+            raise ValueError(
+                "http_responses_session_bridge_instance_id must be explicitly present in "
+                "http_responses_session_bridge_instance_ring"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

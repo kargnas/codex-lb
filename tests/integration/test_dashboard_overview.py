@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from app.core.crypto import TokenEncryptor
-from app.core.utils.time import utcnow
+from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
@@ -54,20 +54,6 @@ async def test_dashboard_overview_combines_data(async_client, db_setup):
             window="secondary",
             recorded_at=secondary_time,
         )
-        await usage_repo.add_entry(
-            "acc_dash",
-            15.0,
-            window="spark_primary",
-            window_label="gpt-5-codex-spark_window",
-            recorded_at=secondary_time,
-        )
-        await usage_repo.add_entry(
-            "acc_dash",
-            35.0,
-            window="spark_secondary",
-            window_label="gpt-5-codex-spark_window",
-            recorded_at=secondary_time,
-        )
         await logs_repo.add_log(
             account_id="acc_dash",
             request_id="req_dash_1",
@@ -80,66 +66,159 @@ async def test_dashboard_overview_combines_data(async_client, db_setup):
             requested_at=now - timedelta(minutes=1),
         )
 
-    response = await async_client.get("/api/dashboard/overview?requestLimit=10&requestOffset=0")
+    response = await async_client.get("/api/dashboard/overview")
     assert response.status_code == 200
     payload = response.json()
 
     assert payload["accounts"][0]["accountId"] == "acc_dash"
     assert payload["summary"]["primaryWindow"]["capacityCredits"] == pytest.approx(225.0)
-    assert payload["summary"]["sparkPrimaryWindow"]["remainingPercent"] == pytest.approx(85.0)
-    assert payload["summary"]["sparkSecondaryWindow"]["remainingPercent"] == pytest.approx(65.0)
-    assert payload["summary"]["sparkWindowLabel"] == "Gpt 5 Codex Spark"
     assert payload["windows"]["primary"]["windowKey"] == "primary"
     assert payload["windows"]["secondary"]["windowKey"] == "secondary"
-    assert payload["windows"]["sparkPrimary"]["windowKey"] == "spark_primary"
-    assert payload["windows"]["sparkSecondary"]["windowKey"] == "spark_secondary"
-    account = payload["accounts"][0]
-    assert account["usage"]["sparkPrimaryRemainingPercent"] == pytest.approx(85.0)
-    assert account["usage"]["sparkSecondaryRemainingPercent"] == pytest.approx(65.0)
-    assert account["sparkWindowLabel"] == "Gpt 5 Codex Spark"
-    assert len(payload["requestLogs"]) == 1
+    assert "requestLogs" not in payload
     assert payload["lastSyncAt"] == secondary_time.isoformat() + "Z"
+
+    # Verify trends are present and have 28 data points each
+    assert "trends" in payload
+    trends = payload["trends"]
+    assert len(trends["requests"]) == 28
+    assert len(trends["tokens"]) == 28
+    assert len(trends["cost"]) == 28
+    assert len(trends["errorRate"]) == 28
+
+    # At least one trend point should have non-zero request count
+    request_values = [p["v"] for p in trends["requests"]]
+    assert any(v > 0 for v in request_values)
 
 
 @pytest.mark.asyncio
-async def test_dashboard_overview_excludes_non_spark_accounts_from_spark_windows(async_client, db_setup):
+async def test_dashboard_overview_maps_weekly_only_primary_to_secondary(async_client, db_setup):
     now = utcnow().replace(microsecond=0)
-    recorded_time = now - timedelta(minutes=2)
 
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
 
-        await accounts_repo.upsert(_make_account("acc_spark_yes", "spark-yes@example.com"))
-        await accounts_repo.upsert(_make_account("acc_spark_no", "spark-no@example.com"))
+        await accounts_repo.upsert(_make_account("acc_plus", "plus@example.com", plan_type="plus"))
+        await accounts_repo.upsert(_make_account("acc_free", "free@example.com", plan_type="free"))
 
         await usage_repo.add_entry(
-            "acc_spark_yes",
-            30.0,
-            window="primary",
-            recorded_at=recorded_time,
-        )
-        await usage_repo.add_entry(
-            "acc_spark_no",
-            40.0,
-            window="primary",
-            recorded_at=recorded_time,
-        )
-        await usage_repo.add_entry(
-            "acc_spark_yes",
+            "acc_plus",
             20.0,
-            window="spark_secondary",
-            window_label="gpt-5-codex-spark_window",
-            recorded_at=recorded_time,
+            window="primary",
+            window_minutes=300,
+            recorded_at=now - timedelta(minutes=2),
+        )
+        await usage_repo.add_entry(
+            "acc_free",
+            20.0,
+            window="primary",
+            window_minutes=10080,
+            recorded_at=now - timedelta(minutes=1),
+        )
+        await usage_repo.add_entry(
+            "acc_plus",
+            40.0,
+            window="secondary",
+            window_minutes=10080,
+            recorded_at=now - timedelta(minutes=1),
         )
 
     response = await async_client.get("/api/dashboard/overview?requestLimit=10&requestOffset=0")
     assert response.status_code == 200
     payload = response.json()
 
-    spark_accounts = payload["windows"]["sparkSecondary"]["accounts"]
-    assert [item["accountId"] for item in spark_accounts] == ["acc_spark_yes"]
+    accounts = {item["accountId"]: item for item in payload["accounts"]}
 
-    account_map = {account["accountId"]: account for account in payload["accounts"]}
-    assert account_map["acc_spark_yes"]["usage"]["sparkSecondaryRemainingPercent"] == pytest.approx(80.0)
-    assert account_map["acc_spark_no"]["usage"]["sparkSecondaryRemainingPercent"] is None
+    assert payload["summary"]["primaryWindow"]["windowMinutes"] == 300
+    assert payload["windows"]["primary"]["windowMinutes"] == 300
+    assert payload["summary"]["secondaryWindow"]["windowMinutes"] == 10080
+    assert accounts["acc_free"]["windowMinutesPrimary"] is None
+    assert accounts["acc_free"]["windowMinutesSecondary"] == 10080
+    assert accounts["acc_free"]["usage"]["secondaryRemainingPercent"] == pytest.approx(80.0)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_overview_computes_depletion_from_recent_db_history(async_client, db_setup):
+    now = utcnow().replace(microsecond=0)
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_depletion", "depletion@example.com"))
+        await usage_repo.add_entry(
+            "acc_depletion",
+            10.0,
+            window="primary",
+            window_minutes=60,
+            reset_at=int(naive_utc_to_epoch(now + timedelta(minutes=45))),
+            recorded_at=now - timedelta(minutes=20),
+        )
+        await usage_repo.add_entry(
+            "acc_depletion",
+            35.0,
+            window="primary",
+            window_minutes=60,
+            reset_at=int(naive_utc_to_epoch(now + timedelta(minutes=45))),
+            recorded_at=now - timedelta(minutes=5),
+        )
+
+    response = await async_client.get("/api/dashboard/overview")
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["depletionPrimary"] is not None
+    assert 0.0 <= payload["depletionPrimary"]["risk"] <= 1.0
+    assert payload["depletionPrimary"]["riskLevel"] in {"safe", "warning", "danger", "critical"}
+
+
+@pytest.mark.asyncio
+async def test_dashboard_overview_weekly_only_depletion_uses_current_stream(async_client, db_setup):
+    now = utcnow().replace(microsecond=0)
+    reset_at = int(naive_utc_to_epoch(now + timedelta(minutes=30)))
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_weekly_depletion", "weekly@example.com", plan_type="free"))
+
+        await usage_repo.add_entry(
+            "acc_weekly_depletion",
+            0.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=now - timedelta(days=6, minutes=2),
+        )
+        await usage_repo.add_entry(
+            "acc_weekly_depletion",
+            5.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=now - timedelta(days=6, minutes=1),
+        )
+        await usage_repo.add_entry(
+            "acc_weekly_depletion",
+            6.0,
+            window="primary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=now - timedelta(minutes=2),
+        )
+        await usage_repo.add_entry(
+            "acc_weekly_depletion",
+            7.0,
+            window="primary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/dashboard/overview")
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["depletionSecondary"] is not None
+    assert payload["depletionSecondary"]["risk"] == pytest.approx(0.37, abs=0.02)

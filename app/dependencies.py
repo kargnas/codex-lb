@@ -4,16 +4,20 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from fastapi import Depends
+from fastapi import Depends, Request, WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import SessionLocal, _safe_close, _safe_rollback, get_session
+from app.db.session import get_background_session, get_session
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.service import AccountsService
+from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.api_keys.service import ApiKeysService
 from app.modules.dashboard.repository import DashboardRepository
 from app.modules.dashboard.service import DashboardService
 from app.modules.dashboard_auth.repository import DashboardAuthRepository
 from app.modules.dashboard_auth.service import DashboardAuthService, get_dashboard_session_store
+from app.modules.firewall.repository import FirewallRepository
+from app.modules.firewall.service import FirewallService
 from app.modules.oauth.service import OauthService
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.service import ProxyService
@@ -22,7 +26,8 @@ from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.request_logs.service import RequestLogsService
 from app.modules.settings.repository import SettingsRepository
 from app.modules.settings.service import SettingsService
-from app.modules.usage.repository import UsageRepository
+from app.modules.sticky_sessions.service import StickySessionsService
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.service import UsageService
 
 
@@ -58,6 +63,13 @@ class ProxyContext:
 
 
 @dataclass(slots=True)
+class ApiKeysContext:
+    session: AsyncSession
+    repository: ApiKeysRepository
+    service: ApiKeysService
+
+
+@dataclass(slots=True)
 class RequestLogsContext:
     session: AsyncSession
     repository: RequestLogsRepository
@@ -78,12 +90,28 @@ class DashboardContext:
     service: DashboardService
 
 
+@dataclass(slots=True)
+class FirewallContext:
+    session: AsyncSession
+    repository: FirewallRepository
+    service: FirewallService
+
+
+@dataclass(slots=True)
+class StickySessionsContext:
+    session: AsyncSession
+    repository: StickySessionsRepository
+    settings_repository: SettingsRepository
+    service: StickySessionsService
+
+
 def get_accounts_context(
     session: AsyncSession = Depends(get_session),
 ) -> AccountsContext:
     repository = AccountsRepository(session)
     usage_repository = UsageRepository(session)
-    service = AccountsService(repository, usage_repository)
+    additional_usage_repository = AdditionalUsageRepository(session)
+    service = AccountsService(repository, usage_repository, additional_usage_repository)
     return AccountsContext(
         session=session,
         repository=repository,
@@ -111,36 +139,21 @@ def get_usage_context(
 
 @asynccontextmanager
 async def _accounts_repo_context() -> AsyncIterator[AccountsRepository]:
-    session = SessionLocal()
-    try:
+    async with get_background_session() as session:
         yield AccountsRepository(session)
-    except BaseException:
-        await _safe_rollback(session)
-        raise
-    finally:
-        if session.in_transaction():
-            await _safe_rollback(session)
-        await _safe_close(session)
 
 
 @asynccontextmanager
 async def _proxy_repo_context() -> AsyncIterator[ProxyRepositories]:
-    session = SessionLocal()
-    try:
+    async with get_background_session() as session:
         yield ProxyRepositories(
             accounts=AccountsRepository(session),
             usage=UsageRepository(session),
             request_logs=RequestLogsRepository(session),
             sticky_sessions=StickySessionsRepository(session),
-            settings=SettingsRepository(session),
+            api_keys=ApiKeysRepository(session),
+            additional_usage=AdditionalUsageRepository(session),
         )
-    except BaseException:
-        await _safe_rollback(session)
-        raise
-    finally:
-        if session.in_transaction():
-            await _safe_rollback(session)
-        await _safe_close(session)
 
 
 def get_oauth_context(
@@ -158,9 +171,31 @@ def get_dashboard_auth_context(
     return DashboardAuthContext(session=session, repository=repository, service=service)
 
 
-def get_proxy_context() -> ProxyContext:
-    service = ProxyService(repo_factory=_proxy_repo_context)
+def get_proxy_context(request: Request) -> ProxyContext:
+    service = get_proxy_service_for_app(request.app)
     return ProxyContext(service=service)
+
+
+def get_proxy_service_for_app(app: object) -> ProxyService:
+    state = getattr(app, "state", None)
+    service = getattr(state, "proxy_service", None)
+    if not isinstance(service, ProxyService):
+        service = ProxyService(repo_factory=_proxy_repo_context)
+        setattr(state, "proxy_service", service)
+    return service
+
+
+def get_proxy_websocket_context(websocket: WebSocket) -> ProxyContext:
+    service = get_proxy_service_for_app(websocket.app)
+    return ProxyContext(service=service)
+
+
+def get_api_keys_context(
+    session: AsyncSession = Depends(get_session),
+) -> ApiKeysContext:
+    repository = ApiKeysRepository(session)
+    service = ApiKeysService(repository)
+    return ApiKeysContext(session=session, repository=repository, service=service)
 
 
 def get_request_logs_context(
@@ -185,3 +220,25 @@ def get_dashboard_context(
     repository = DashboardRepository(session)
     service = DashboardService(repository)
     return DashboardContext(session=session, repository=repository, service=service)
+
+
+def get_firewall_context(
+    session: AsyncSession = Depends(get_session),
+) -> FirewallContext:
+    repository = FirewallRepository(session)
+    service = FirewallService(repository)
+    return FirewallContext(session=session, repository=repository, service=service)
+
+
+def get_sticky_sessions_context(
+    session: AsyncSession = Depends(get_session),
+) -> StickySessionsContext:
+    repository = StickySessionsRepository(session)
+    settings_repository = SettingsRepository(session)
+    service = StickySessionsService(repository, settings_repository)
+    return StickySessionsContext(
+        session=session,
+        repository=repository,
+        settings_repository=settings_repository,
+        service=service,
+    )

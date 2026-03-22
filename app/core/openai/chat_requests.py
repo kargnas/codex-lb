@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -16,6 +16,28 @@ from app.core.openai.requests import (
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 
+_SUPPORTED_CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
+
+
+def _content_parts(content: JsonValue) -> list[JsonValue]:
+    if is_json_list(content):
+        return cast(list[JsonValue], content)
+    return [content]
+
+
+def _part_type(part: Mapping[str, JsonValue]) -> str | None:
+    explicit_type = part.get("type")
+    if isinstance(explicit_type, str) and explicit_type:
+        return explicit_type
+    text_value = part.get("text")
+    return "text" if isinstance(text_value, str) else None
+
+
+def _json_mapping(value: object) -> Mapping[str, JsonValue] | None:
+    if not is_json_mapping(value):
+        return None
+    return cast(Mapping[str, JsonValue], value)
+
 
 class ChatCompletionsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -29,12 +51,13 @@ class ChatCompletionsRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     stop: str | list[str] | None = None
-    n: int | None = None
+    n: int | None = Field(default=None, ge=1, le=1)
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     logprobs: bool | None = None
     top_logprobs: int | None = None
     seed: int | None = None
+    service_tier: str | None = None
     response_format: JsonValue | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
@@ -50,20 +73,22 @@ class ChatCompletionsRequest(BaseModel):
     @classmethod
     def _reject_file_id(cls, value: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
         for message in value:
-            if not is_json_mapping(message):
+            message_mapping = _json_mapping(message)
+            if message_mapping is None:
                 continue
-            content = message.get("content")
-            parts = content if is_json_list(content) else [content]
-            for part in parts:
-                if not is_json_mapping(part):
+            content = message_mapping.get("content")
+            for part in _content_parts(content):
+                part_mapping = _json_mapping(part)
+                if part_mapping is None:
                     continue
-                part_type = part.get("type") or ("text" if "text" in part else None)
-                if part_type != "file" and "file" not in part:
+                part_type = _part_type(part_mapping)
+                file_info = part_mapping.get("file")
+                if part_type != "file" and _json_mapping(file_info) is None:
                     continue
-                file_info = part.get("file")
-                if not is_json_mapping(file_info):
+                file_info_mapping = _json_mapping(file_info)
+                if file_info_mapping is None:
                     continue
-                file_id = file_info.get("file_id")
+                file_id = file_info_mapping.get("file_id")
                 if isinstance(file_id, str) and file_id:
                     raise ValueError("file_id is not supported")
         return value
@@ -77,11 +102,19 @@ class ChatCompletionsRequest(BaseModel):
                 raise ValueError("'messages' must contain objects.")
             role = message.get("role")
             role_name = role if isinstance(role, str) else None
+            if role_name is None:
+                raise ValueError("Each message must include a string 'role'.")
+            if role_name not in _SUPPORTED_CHAT_ROLES:
+                raise ValueError(f"Unsupported message role: {role_name}")
             content = message.get("content")
             if role_name in ("system", "developer"):
                 _ensure_text_only_content(content, role_name)
             elif role_name == "user":
                 _validate_user_content(content)
+            elif role_name == "assistant":
+                _validate_assistant_tool_calls(message)
+            elif role_name == "tool":
+                _validate_tool_message(message)
         return self
 
     def to_responses_request(self) -> ResponsesRequest:
@@ -89,6 +122,7 @@ class ChatCompletionsRequest(BaseModel):
         messages = data.pop("messages")
         messages = _sanitize_user_messages(messages)
         data.pop("store", None)
+        data.pop("n", None)
         data.pop("max_tokens", None)
         data.pop("max_completion_tokens", None)
         response_format = data.pop("response_format", None)
@@ -116,18 +150,9 @@ class ChatCompletionsRequest(BaseModel):
 class ChatResponseFormatJsonSchema(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
-    name: str | None = None
+    name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
     schema_: JsonValue | None = Field(default=None, alias="schema")
     strict: bool | None = None
-
-    @field_validator("name")
-    @classmethod
-    def _validate_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
-            raise ValueError("response_format.json_schema.name must match [A-Za-z0-9_-]{1,64}")
-        return value
 
 
 class ChatResponseFormat(BaseModel):
@@ -257,23 +282,25 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
     if isinstance(content, str):
         return
     if is_json_list(content):
-        for part in content:
+        for part in _content_parts(content):
             if isinstance(part, str):
                 continue
-            if is_json_mapping(part):
-                part_type = part.get("type")
+            part_mapping = _json_mapping(part)
+            if part_mapping is not None:
+                part_type = part_mapping.get("type")
                 if part_type not in (None, "text"):
                     raise ValueError(f"{role} messages must be text-only.")
-                text = part.get("text")
+                text = part_mapping.get("text")
                 if isinstance(text, str):
                     continue
             raise ValueError(f"{role} messages must be text-only.")
         return
-    if is_json_mapping(content):
-        part_type = content.get("type")
+    content_mapping = _json_mapping(content)
+    if content_mapping is not None:
+        part_type = content_mapping.get("type")
         if part_type not in (None, "text"):
             raise ValueError(f"{role} messages must be text-only.")
-        text = content.get("text")
+        text = content_mapping.get("text")
         if isinstance(text, str):
             return
     raise ValueError(f"{role} messages must be text-only.")
@@ -282,21 +309,21 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
 def _validate_user_content(content: JsonValue) -> None:
     if content is None or isinstance(content, str):
         return
-    parts = content if is_json_list(content) else [content]
-    for part in parts:
+    for part in _content_parts(content):
         if isinstance(part, str):
             continue
-        if not is_json_mapping(part):
+        part_mapping = _json_mapping(part)
+        if part_mapping is None:
             raise ValueError("User message content parts must be objects.")
-        part_type = part.get("type") or ("text" if "text" in part else None)
+        part_type = _part_type(part_mapping)
         if part_type == "text":
-            text = part.get("text")
+            text = part_mapping.get("text")
             if not isinstance(text, str):
                 raise ValueError("Text content parts must include a string 'text'.")
             continue
         if part_type == "image_url":
-            image_url = part.get("image_url")
-            if not is_json_mapping(image_url):
+            image_url = _json_mapping(part_mapping.get("image_url"))
+            if image_url is None:
                 raise ValueError("Image content parts must include image_url.url.")
             if not isinstance(image_url.get("url"), str):
                 raise ValueError("Image content parts must include image_url.url.")
@@ -304,11 +331,45 @@ def _validate_user_content(content: JsonValue) -> None:
         if part_type == "input_audio":
             raise ValueError("Audio input is not supported.")
         if part_type == "file":
-            file_info = part.get("file")
-            if not is_json_mapping(file_info):
+            file_info = _json_mapping(part_mapping.get("file"))
+            if file_info is None:
                 raise ValueError("File content parts must include file metadata.")
             continue
         raise ValueError(f"Unsupported user content part type: {part_type}")
+
+
+def _validate_tool_message(message: Mapping[str, JsonValue]) -> None:
+    tool_call_id = message.get("tool_call_id")
+    tool_call_id_camel = message.get("toolCallId")
+    call_id = message.get("call_id")
+    resolved_call_id = tool_call_id if isinstance(tool_call_id, str) and tool_call_id else None
+    if resolved_call_id is None and isinstance(tool_call_id_camel, str) and tool_call_id_camel:
+        resolved_call_id = tool_call_id_camel
+    if resolved_call_id is None and isinstance(call_id, str) and call_id:
+        resolved_call_id = call_id
+    if not isinstance(resolved_call_id, str) or not resolved_call_id:
+        raise ValueError("tool messages must include 'tool_call_id'.")
+
+
+def _validate_assistant_tool_calls(message: Mapping[str, JsonValue]) -> None:
+    tool_calls = message.get("tool_calls")
+    if tool_calls is None:
+        return
+    if not is_json_list(tool_calls):
+        raise ValueError("assistant message 'tool_calls' must be an array.")
+    for index, tool_call in enumerate(_content_parts(tool_calls)):
+        tool_call_mapping = _json_mapping(tool_call)
+        if tool_call_mapping is None:
+            raise ValueError(f"assistant tool_calls[{index}] must be an object.")
+        call_id = tool_call_mapping.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            raise ValueError(f"assistant tool_calls[{index}] must include a non-empty 'id'.")
+        function = _json_mapping(tool_call_mapping.get("function"))
+        if function is None:
+            raise ValueError(f"assistant tool_calls[{index}] must include a 'function' object.")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"assistant tool_calls[{index}].function must include a non-empty 'name'.")
 
 
 def _sanitize_user_messages(messages: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
@@ -330,19 +391,16 @@ def _sanitize_user_messages(messages: list[dict[str, JsonValue]]) -> list[dict[s
 def _drop_oversized_images(content: JsonValue) -> JsonValue | None:
     if content is None or isinstance(content, str):
         return content
-    parts = content if is_json_list(content) else [content]
     sanitized_parts: list[JsonValue] = []
-    for part in parts:
-        if not is_json_mapping(part):
+    for part in _content_parts(content):
+        part_mapping = _json_mapping(part)
+        if part_mapping is None:
             sanitized_parts.append(part)
             continue
-        part_type = part.get("type") or ("text" if "text" in part else None)
+        part_type = _part_type(part_mapping)
         if part_type == "image_url":
-            image_url = part.get("image_url")
-            if is_json_mapping(image_url):
-                url = image_url.get("url")
-            else:
-                url = None
+            image_url = _json_mapping(part_mapping.get("image_url"))
+            url = image_url.get("url") if image_url is not None else None
             if isinstance(url, str) and _is_oversized_data_url(url):
                 continue
         sanitized_parts.append(part)

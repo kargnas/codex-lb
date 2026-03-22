@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -20,6 +21,10 @@ from app.core.utils.time import to_utc_naive, utcnow
 TOKEN_REFRESH_INTERVAL_DAYS = 8
 
 logger = logging.getLogger(__name__)
+_TOKEN_REFRESH_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "token_refresh_timeout_override",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -75,7 +80,7 @@ async def refresh_access_token(
         "refresh_token": refresh_token,
         "scope": settings.oauth_scope,
     }
-    timeout = aiohttp.ClientTimeout(total=settings.token_refresh_timeout_seconds)
+    timeout = aiohttp.ClientTimeout(total=_effective_token_refresh_timeout(settings.token_refresh_timeout_seconds))
 
     client_session = session or get_http_client().session
     headers: dict[str, str] = {}
@@ -142,6 +147,14 @@ def is_transient_error(error: RefreshError) -> bool:
     return error.code in TRANSIENT_ERROR_CODES
 
 
+def push_token_refresh_timeout_override(timeout_seconds: float | None) -> contextvars.Token[float | None]:
+    return _TOKEN_REFRESH_TIMEOUT_OVERRIDE.set(timeout_seconds)
+
+
+def pop_token_refresh_timeout_override(token: contextvars.Token[float | None]) -> None:
+    _TOKEN_REFRESH_TIMEOUT_OVERRIDE.reset(token)
+
+
 async def _safe_json(resp: aiohttp.ClientResponse) -> JsonObject:
     try:
         data = await resp.json(content_type=None)
@@ -155,6 +168,13 @@ def _refresh_error_from_payload(payload: OAuthTokenPayload, status_code: int) ->
     code = _extract_error_code(payload) or f"http_{status_code}"
     message = _extract_error_message(payload) or f"Token refresh failed ({status_code})"
     return RefreshError(code, message, classify_refresh_error(code))
+
+
+def _effective_token_refresh_timeout(configured_timeout_seconds: float) -> float:
+    override = _TOKEN_REFRESH_TIMEOUT_OVERRIDE.get()
+    if override is None:
+        return configured_timeout_seconds
+    return max(0.001, min(configured_timeout_seconds, override))
 
 
 def _extract_error_code(payload: OAuthTokenPayload) -> str | None:

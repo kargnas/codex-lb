@@ -187,6 +187,86 @@ async def test_proxy_stream_retries_rate_limit_then_success(async_client, monkey
 
 
 @pytest.mark.asyncio
+async def test_proxy_stream_does_not_retry_stream_idle_timeout(async_client, monkeypatch):
+    await _import_account(async_client, "acc_idle_1", "idle-one@example.com")
+    await _import_account(async_client, "acc_idle_2", "idle-two@example.com")
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        event = {
+            "type": "response.failed",
+            "response": {"error": {"code": "stream_idle_timeout", "message": "idle"}},
+        }
+        yield _sse_event(event)
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json=payload,
+    ) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    event = _extract_first_event(lines)
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "stream_idle_timeout"
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
+        logs = list(result.scalars().all())
+        assert len(logs) == 1
+        assert logs[0].error_code == "stream_idle_timeout"
+
+
+@pytest.mark.asyncio
+async def test_proxy_stream_drops_forwarded_headers(async_client, monkeypatch):
+    await _import_account(async_client, "acc_headers", "headers@example.com")
+    captured_headers: dict[str, str] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        captured_headers.update(headers)
+        event = {
+            "type": "response.completed",
+            "response": {"id": "resp_headers", "usage": {"input_tokens": 1, "output_tokens": 1}},
+        }
+        yield _sse_event(event)
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    request_headers = {
+        "x-forwarded-for": "1.2.3.4",
+        "x-forwarded-proto": "https",
+        "x-real-ip": "1.2.3.4",
+        "forwarded": "for=1.2.3.4;proto=https",
+        "cf-connecting-ip": "1.2.3.4",
+        "cf-ray": "ray123",
+        "true-client-ip": "1.2.3.4",
+        "user-agent": "codex-test",
+    }
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json=payload,
+        headers=request_headers,
+    ) as resp:
+        assert resp.status_code == 200
+        _ = [line async for line in resp.aiter_lines() if line]
+
+    normalized = {key.lower() for key in captured_headers}
+    assert "x-forwarded-for" not in normalized
+    assert "x-forwarded-proto" not in normalized
+    assert "x-real-ip" not in normalized
+    assert "forwarded" not in normalized
+    assert "cf-connecting-ip" not in normalized
+    assert "cf-ray" not in normalized
+    assert "true-client-ip" not in normalized
+    assert "user-agent" in normalized
+
+
+@pytest.mark.asyncio
 async def test_proxy_stream_usage_limit_returns_http_error(async_client, monkeypatch):
     expected_account_id = await _import_account(async_client, "acc_limit", "limit@example.com")
 
