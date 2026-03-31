@@ -139,7 +139,9 @@
       "avatar_url": "https://avatars.githubusercontent.com/u/2706884?v=4",
       "profile": "https://github.com/ink-splatters",
       "contributions": [
-        "doc"
+        "doc",
+        "code",
+        "bug"
       ]
     },
     {
@@ -201,7 +203,9 @@
       "profile": "https://linktree.huzky.dev/",
       "contributions": [
         "code",
-        "bug"
+        "bug",
+        "question",
+        "maintenance"
       ]
     },
     {
@@ -222,6 +226,16 @@
       "contributions": [
         "code",
         "test"
+      ]
+    },
+    {
+      "login": "yigitkonur",
+      "name": "Yigit Konur",
+      "avatar_url": "https://avatars.githubusercontent.com/u/9989650?v=4",
+      "profile": "https://www.linkedin.com/in/yigitkonur/",
+      "contributions": [
+        "bug",
+        "code"
       ]
     }
   ],

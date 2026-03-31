@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -20,6 +20,7 @@ from app.modules.api_keys.service import (
     ApiKeyRateLimitExceededError,
     ApiKeysRepositoryProtocol,
     ApiKeysService,
+    ApiKeyUpdateData,
     LimitRuleInput,
 )
 
@@ -389,6 +390,26 @@ async def test_create_key_stores_hash_and_prefix() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_key_normalizes_timezone_aware_expiry_to_utc_naive() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="expiring-key",
+            allowed_models=None,
+            expires_at=datetime(2026, 3, 20, 23, 59, 59, tzinfo=timezone(timedelta(hours=9))),
+        )
+    )
+
+    assert created.expires_at == datetime(2026, 3, 20, 14, 59, 59)
+
+    stored = await repo.get_by_id(created.id)
+    assert stored is not None
+    assert stored.expires_at == datetime(2026, 3, 20, 14, 59, 59)
+
+
+@pytest.mark.asyncio
 async def test_create_key_rejects_enforced_model_outside_allowed_models() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
@@ -619,6 +640,27 @@ async def test_enforce_limits_reserves_tier_aware_cost_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_key_normalizes_timezone_aware_expiry_to_utc_naive() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(ApiKeyCreateData(name="update-expiry", allowed_models=None, expires_at=None))
+
+    updated = await service.update_key(
+        created.id,
+        ApiKeyUpdateData(
+            expires_at=datetime(2026, 4, 1, 5, 30, 0, tzinfo=timezone(timedelta(hours=-7))),
+            expires_at_set=True,
+        ),
+    )
+
+    assert updated.expires_at == datetime(2026, 4, 1, 12, 30, 0)
+
+    stored = await repo.get_by_id(created.id)
+    assert stored is not None
+    assert stored.expires_at == datetime(2026, 4, 1, 12, 30, 0)
+
+
+@pytest.mark.asyncio
 async def test_regenerate_key_rotates_hash_and_prefix() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
@@ -746,6 +788,34 @@ async def test_record_usage_cost_limit_uses_service_tier_pricing() -> None:
     limits = await repo.get_limits_by_key(created.id)
     cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
     assert cost_limit.current_value == 35_000_000
+
+
+@pytest.mark.asyncio
+async def test_record_usage_cost_limit_uses_legacy_gpt_5_priority_pricing() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="legacy-priority-cost-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[
+                LimitRuleInput(limit_type="cost_usd", limit_window="weekly", max_value=100_000_000),
+            ],
+        )
+    )
+
+    await service.record_usage(
+        created.id,
+        model="gpt-5.1",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        service_tier="priority",
+    )
+
+    limits = await repo.get_limits_by_key(created.id)
+    cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
+    assert cost_limit.current_value == 22_500_000
 
 
 @pytest.mark.asyncio
