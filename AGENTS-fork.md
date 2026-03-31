@@ -32,6 +32,7 @@ Do not remove `upstream`. Upstream sync work should continue to use the `upstrea
 
 | Date | Upstream Tag | Commit | Notes |
 |------|--------------|--------|-------|
+| 2026-03-31 | `v1.8.3` | `90d0983` | Merged upstream v1.8.3; resolved load_balancer.py conflicts (adopted upstream select_account simplification); no active fork patches |
 | 2026-03-23 | `v1.8.0` | `0cad3f3` | Merged upstream `v1.8.0` into `kars` and revalidated targeted tests |
 
 ## Active Fork Patches
